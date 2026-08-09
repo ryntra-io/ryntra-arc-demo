@@ -17,7 +17,20 @@ import {
   Wallet,
 } from "@phosphor-icons/react";
 
-import { ARC_PROJECT } from "../arc/arc-project.ts";
+import { ARC_PROJECT, RECORDED_RUN } from "../arc/arc-project.ts";
+import {
+  GUARD_API_EXAMPLE as API_EXAMPLE,
+  GUARD_SDK_EXAMPLE as SDK_EXAMPLE,
+} from "../../lib/guard/developer-examples.ts";
+import {
+  GUARD_STATUS_AXIS_DEFINITIONS,
+  resolveGuardStatusAxes,
+  type GuardAuthorizationStatus,
+  type GuardEvidenceStatus,
+  type GuardExecutionStatus,
+  type GuardPolicyDecision,
+  type GuardReconciliationStatus,
+} from "../../lib/guard/status-values.ts";
 import styles from "./arc-guard.module.css";
 import { OperationLifecycle } from "./operation-lifecycle.tsx";
 
@@ -59,10 +72,11 @@ type Capability = {
   erc20UsdcDecimals: 6;
   memoSupported: false;
   circleCredentialConfigured: boolean;
-  liveExecutionVerified: false;
-  transactionHash: null;
-  explorerUrl: null;
-  authorizationMethod: "PARTNER_AUTHENTICATED";
+  capabilityStatus: string;
+  liveExecutionVerified: boolean;
+  transactionHash: string | null;
+  explorerUrl: string | null;
+  authorizationMethod: "PARTNER_AUTHENTICATED_ON_AUTHENTICATED_V1_ONLY";
   executionBinding: "APP_KIT_REQUEST_NOT_CALLDATA";
   limitations: string[];
 };
@@ -72,23 +86,16 @@ type FingerprintValue = Record<string, unknown> & {
   walletAddress: string;
 };
 
-type PolicyDecision =
-  | "ALLOWED_BY_POLICY"
-  | "REVIEW_REQUIRED"
-  | "BLOCKED_BY_RULE"
-  | "INSUFFICIENT_EVIDENCE"
-  | "UNSUPPORTED"
-  | "EXPIRED";
-
 type Evaluation = Record<string, unknown> & {
   id: string;
-  outcome: PolicyDecision;
+  outcome: GuardPolicyDecision;
   dataStatus: string;
-  evidenceStatus: string;
-  policyDecision: PolicyDecision;
+  evidenceStatus: GuardEvidenceStatus;
+  policyDecision: GuardPolicyDecision;
   policyStatus: string;
-  authorizationStatus: string;
-  executionStatus: string;
+  authorizationStatus: GuardAuthorizationStatus;
+  executionStatus: GuardExecutionStatus;
+  reconciliationStatus: GuardReconciliationStatus;
   blockers: string[];
   missingEvidence: string[];
 };
@@ -135,8 +142,16 @@ type Authorization = Record<string, unknown> & {
 type EvidenceReceipt = Record<string, unknown> & {
   receiptHash: string;
   preflightHash: string;
-  reconciliationStatus: "MATCHED" | "DEVIATION_RECORDED";
-  execution: { transactionHash: string; explorerUrl: string; status: string };
+  evidenceStatus: GuardEvidenceStatus;
+  policyDecision: GuardPolicyDecision;
+  authorizationStatus: GuardAuthorizationStatus;
+  executionStatus: GuardExecutionStatus;
+  reconciliationStatus: GuardReconciliationStatus;
+  execution: {
+    transactionHash: string;
+    explorerUrl: string;
+    status: GuardExecutionStatus;
+  };
   expectedEffects: Record<string, string>;
   actualEffects: Record<string, string>;
 };
@@ -160,26 +175,6 @@ type ApiFailure = {
  * exist, and every session died at "wrong network". A browser cannot be the
  * authority on which network the server is talking to.
  */
-
-const SDK_EXAMPLE = `const intent = await ryntra.intents.create(input, { idempotencyKey });
-const evaluation = await ryntra.preflight(intent.id, evidence);
-if (evaluation.evidenceStatus !== "COMPLETE") return showMissing(evaluation);
-if (evaluation.policyDecision === "BLOCKED_BY_RULE") return showBlockers(evaluation);
-const authorization = await ryntra.authorize({
-  intentId: intent.id,
-  evaluationId: evaluation.id,
-  executionFingerprint,
-});
-const txHash = await partnerWallet.execute(transaction);
-await ryntra.executions.record({ intentId: intent.id, authorizationId: authorization.id, executionFingerprint, txHash });`;
-
-const API_EXAMPLE = `POST /v1/intents/{intentId}/preflight
-Authorization: Bearer <tenant-scoped-server-key>
-Idempotency-Key: demo-preflight-001
-
-{
-  "evidence": [{ "sourceType": "SWAP_QUOTE", "status": "VALID" }]
-}`;
 
 const WAITING_CHECKS = [
   ["Arc Testnet network", "WAITING"],
@@ -235,7 +230,9 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
   const [busy, setBusy] = useState<
     "connect" | "estimate" | "authorize" | "execute" | "reconcile" | null
   >(null);
-  const [message, setMessage] = useState("Connect an EVM wallet to begin the Testnet flow.");
+  const [message, setMessage] = useState(
+    "Connect an EVM wallet to inspect an unsigned Testnet preflight; authorization requires authenticated /v1.",
+  );
   const [error, setError] = useState<string | null>(null);
   const [devTab, setDevTab] = useState<"sdk" | "api" | "receipt">("sdk");
   const [copied, setCopied] = useState(false);
@@ -288,11 +285,11 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
   const network = capability?.network ?? null;
   const onArc = network !== null && chainId?.toLowerCase() === network.hexChainId.toLowerCase();
   const evaluation = flow?.evaluation ?? null;
-  const canAuthorize = Boolean(
-    flow?.fingerprint &&
-      !authorization &&
-      (evaluation?.policyDecision === "ALLOWED_BY_POLICY" || evaluation?.policyDecision === "REVIEW_REQUIRED"),
-  );
+  const statusAxes = resolveGuardStatusAxes(evaluation, receipt);
+  /* The public cookie session is intentionally not partner authentication or
+     wallet-ownership proof. It may prepare an unsigned preflight, but lifecycle
+     authorization is available only on the authenticated `/v1` API. */
+  const canAuthorize = false;
   const isTransfer = flowMode === "transfer";
   const canExecuteTransfer = Boolean(
     flow?.flowKind === "EOA_USDC_TRANSFER" &&
@@ -435,7 +432,9 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
       });
       const data = await parseResponse<DemoFlow>(response);
       setFlow(data);
-      setMessage(`Preflight completed: ${data.evaluation.policyDecision}.`);
+      setMessage(
+        `Unsigned preflight completed: ${data.evaluation.policyDecision}. Authorization and execution require authenticated /v1.`,
+      );
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Preflight failed.");
     } finally {
@@ -617,13 +616,16 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
       )}
 
       <main className={embedded ? styles.mainEmbedded : styles.main}>
+        {/* Rendered from ARC_PROJECT, not typed. Fixing the capability card
+            earlier while leaving these five literals in place is how the same
+            defect survives its own fix: the card could no longer drift and the
+            rail beside it still could. */}
         {embedded ? null : (
           <section className={styles.statusRail} aria-label="Prototype status">
-            <span>INDEPENDENT PROJECT</span>
-            <span className={styles.cyan}>ARC TESTNET</span>
-            <span>TESTNET ONLY</span>
-            <span>NOT AUDITED</span>
-            <span>NOT FINANCIAL ADVICE</span>
+            {ARC_PROJECT.claimRail.map((claim) => (
+              <span key={claim}>{claim}</span>
+            ))}
+            <span className={styles.cyan}>{ARC_PROJECT.network.toUpperCase()}</span>
           </section>
         )}
 
@@ -645,7 +647,7 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
                 first impression of a product whose whole claim is that its
                 surfaces agree with its evidence. One source removes that class,
                 and the test asserts the stale wording cannot return. */}
-            <strong>{ARC_PROJECT.status}</strong>
+            <strong>{capability?.capabilityStatus ?? "CHECKING CAPABILITY FRESHNESS"}</strong>
             <p>
               {capability?.circleCredentialConfigured
                 ? "The exact EOA transfer path is proven by one recorded Arc Testnet run. The App Kit swap estimate is available in source and has never executed."
@@ -806,12 +808,15 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
             </div>
             <div className={`${styles.outcome} ${outcomeClass}`}>
               <span>POLICY DECISION</span>
-              <strong>{evaluation?.policyDecision ?? "WAITING FOR EVIDENCE"}</strong>
+              <strong>{statusAxes.policyDecision ?? "—"}</strong>
             </div>
             <div className={styles.axisGrid} aria-label="Independent Guard status axes">
-              <span><small>EVIDENCE</small><b>{evaluation?.evidenceStatus ?? "NOT COLLECTED"}</b></span>
-              <span><small>POLICY</small><b>{evaluation?.policyDecision ?? "NOT EVALUATED"}</b></span>
-              <span><small>EXECUTION</small><b>{receipt ? "CONFIRMED" : transactionHash ? "SUBMITTED" : "NOT STARTED"}</b></span>
+              {GUARD_STATUS_AXIS_DEFINITIONS.map((axis) => (
+                <span key={axis.key}>
+                  <small>{axis.label}</small>
+                  <b>{statusAxes[axis.key] ?? "—"}</b>
+                </span>
+              ))}
             </div>
             <ul className={styles.checks}>
               {checks.map(([label, status]) => (
@@ -825,9 +830,14 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
               className={styles.authorizeButton}
               onClick={authorize}
               disabled={!canAuthorize || busy !== null}
+              title="The anonymous demo cannot create partner authorization. Use authenticated /v1."
             >
               <Fingerprint size={18} aria-hidden />
-              {authorization ? "Human authorized" : busy === "authorize" ? "Recording…" : "Authorize exact intent"}
+              {authorization
+                ? "Human authorized"
+                : busy === "authorize"
+                  ? "Recording…"
+                  : "Authenticated /v1 authorization required"}
             </button>
             <button
               className={styles.walletButton}
@@ -848,12 +858,10 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
                         ? "Sign exact transfer in wallet"
                         : "Wallet signature unavailable"}
             </button>
-            {/* Six states, listed separately. Ryntra recording that a human
-                approved an exact intent and a key holder signing a transaction
-                are different facts with different weight, and the single line
-                that used to sit here invited a reader to believe the
-                application authorized the money movement. It authorized
-                nothing but its own record of a decision. */}
+            {/* Six states, listed separately. Authenticated `/v1` recording
+                approval of an exact intent and a key holder signing a transaction
+                are different facts with different weight. This anonymous demo
+                performs neither; it renders unsigned preflight evidence only. */}
             <div className={styles.lifecycleBlock}>
               <OperationLifecycle
                 authorized={Boolean(authorization)}
@@ -906,7 +914,7 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
         </div>
 
         {/* The one state an operator must never walk away from: a real
-            transaction exists on Arc and nobody has read what it did. It is
+            transaction exists on Arc and its result has not been read. It is
             recoverable and it is not automatic — Ryntra will not rebroadcast,
             because a second broadcast of a transaction that already succeeded
             would move the money twice. So the recovery is stated, with the
@@ -918,9 +926,9 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
               <strong>Reconciliation required</strong>
               <p>
                 Transaction <code>{transactionHash}</code> was broadcast and its result has not
-                been read. The transaction is safe: it is on Arc whether or not this page is
-                open, and Ryntra never rebroadcasts — a second broadcast of a transaction that
-                already succeeded would move the money twice.
+                been read. Closing this page does not cancel a broadcast already submitted to
+                Arc, and Ryntra does not automatically rebroadcast it. A second broadcast of a
+                transaction that already succeeded could move the money twice.
               </p>
               <p>
                 Recover by pressing <strong>Reconcile Arc transaction</strong>. If the Arc RPC
@@ -982,7 +990,7 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
               <div><dt>Ryntra authorization</dt><dd>{authorization ? "RECORDED" : "PENDING"}</dd></div>
               <div><dt>Wallet signature</dt><dd>{transactionHash ? "SIGNED BY KEY HOLDER" : "NOT SIGNED"}</dd></div>
               <div><dt>Transaction</dt><dd className={styles.mono}>{transactionHash ? shortAddress(transactionHash) : "NOT VERIFIED"}</dd></div>
-              <div><dt>Reconciliation</dt><dd>{receipt?.reconciliationStatus ?? (transactionHash ? "REQUIRED" : "NOT STARTED")}</dd></div>
+              <div><dt>Reconciliation</dt><dd>{statusAxes.reconciliationStatus ?? "—"}</dd></div>
               <div><dt>Receipt hash</dt><dd className={styles.mono}>{receipt ? shortAddress(receipt.receiptHash) : "—"}</dd></div>
             </dl>
             <div className={receipt ? styles.receiptSuccess : styles.receiptBlocker}>
@@ -996,6 +1004,37 @@ export function ArcGuardDemo({ embedded = false }: { embedded?: boolean } = {}) 
                 <ArrowSquareOut size={15} aria-hidden />
               </a>
             ) : null}
+          </div>
+
+          {/* The judge's path cannot depend on the visitor performing a
+              transaction. The one recorded run renders here under its own
+              truth label — it is the historical proof, never this session's
+              state, and the two are deliberately separate panels. */}
+          <div className={styles.receiptPanel} aria-label="Recorded Arc Testnet run">
+            <div className={styles.panelHead}>
+              <div><p>RECORDED ARC TESTNET RUN</p><h2>Reconciled proof</h2></div>
+              <FileCode size={22} aria-hidden />
+            </div>
+            <dl>
+              <div><dt>Operation</dt><dd>{RECORDED_RUN.operation}</dd></div>
+              <div><dt>Amount</dt><dd>{RECORDED_RUN.amount}</dd></div>
+              <div><dt>Transaction</dt><dd className={styles.mono}>{shortAddress(RECORDED_RUN.transactionHash)} · block {RECORDED_RUN.blockNumber}</dd></div>
+              <div><dt>Reconciliation</dt><dd>{RECORDED_RUN.reconciliationStatus} · {RECORDED_RUN.verificationStatus}</dd></div>
+              <div><dt>Receipt</dt><dd className={styles.mono}>{RECORDED_RUN.receiptId}</dd></div>
+              <div><dt>Receipt hash</dt><dd className={styles.mono}>{shortAddress(RECORDED_RUN.receiptHash)}</dd></div>
+            </dl>
+            <div className={styles.receiptSuccess}>
+              The one recorded, reconciled run on Arc Public Testnet, shown for review. The session
+              panel above starts empty; only a real new transaction fills it.
+            </div>
+            <a
+              href={RECORDED_RUN.explorerUrl}
+              target="_blank"
+              rel="noreferrer"
+              className={styles.explorerLink}
+            >
+              Open the recorded transaction <ArrowSquareOut size={15} aria-hidden />
+            </a>
           </div>
         </section>
 

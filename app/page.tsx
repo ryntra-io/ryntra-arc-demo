@@ -11,7 +11,10 @@ import {
   SCOPE_AND_LIMITATIONS,
   TWO_SURFACES,
 } from "./arc/arc-project.ts";
+import { getArcVerificationStatus } from "./arc/arc-status.ts";
 import styles from "./page.module.css";
+
+export const revalidate = 3_600;
 
 /**
  * The reviewer's first screen.
@@ -50,7 +53,7 @@ export default function HomePage() {
           effects, and produces a structured Execution Receipt.
         </p>
 
-        <p className={styles.status}>{ARC_PROJECT.status}</p>
+        <p className={styles.status}>{getArcVerificationStatus(new Date()).label}</p>
 
         <div className={styles.actions}>
           <Link className={styles.primary} href="/arc/demo">

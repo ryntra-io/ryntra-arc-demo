@@ -1,6 +1,8 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { compareCanonicalStrings } from "./canonical.ts";
+
 /**
  * Guard prototype persistence port.
  *
@@ -56,6 +58,12 @@ export type GuardCollection<T> = {
    * and `false` when the key already existed — never overwriting the winner.
    */
   insertIfAbsent(key: string, value: T): Promise<boolean>;
+  /**
+   * Atomically claim every key in one collection. Either all entries are
+   * inserted or none are. Sorting is handled by the adapter so concurrent
+   * writers acquire overlapping keys in one deterministic order.
+   */
+  insertAllIfAbsent(entries: readonly { key: string; value: T }[]): Promise<boolean>;
   /**
    * Remove a key. Used to release a claim whose operation failed — a burnt
    * idempotency key would make a corrected retry impossible forever.
@@ -127,6 +135,19 @@ export function createMemoryGuardStore(): GuardStore {
           map.set(key, value);
           return true;
         },
+        async insertAllIfAbsent(entries) {
+          const ordered = [...entries].sort((left, right) =>
+            compareCanonicalStrings(left.key, right.key),
+          );
+          const keys = new Set(ordered.map((entry) => entry.key));
+          if (keys.size !== ordered.length) {
+            throw new TypeError("Guard batch claims require unique keys.");
+          }
+          const map = mapFor(name);
+          if (ordered.some((entry) => map.has(entry.key))) return false;
+          for (const entry of ordered) map.set(entry.key, entry.value);
+          return true;
+        },
         async delete(key) {
           mapFor(name).delete(key);
         },
@@ -148,13 +169,13 @@ export function createMemoryGuardStore(): GuardStore {
 function readCollectionFile(file: string): Map<string, unknown> {
   try {
     const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return new Map();
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new TypeError(`Invalid Guard collection state in ${file}.`);
+    }
     return new Map(Object.entries(parsed as Record<string, unknown>));
-  } catch {
-    // A missing file is the normal empty state. A corrupt file is treated the
-    // same way on purpose: the kernel then reports the lifecycle as absent
-    // rather than resuming from half-written objects it cannot verify.
-    return new Map();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map();
+    throw new Error(`Guard collection is corrupt or unreadable: ${file}.`, { cause: error });
   }
 }
 
@@ -202,23 +223,47 @@ export function createFileGuardStore(options: { directory: string }): GuardStore
           return snapshot(name).get(key) as T | undefined;
         },
         async set(key, value) {
-          const map = snapshot(name);
-          map.set(key, value);
-          writeCollectionFile(options.directory, file, map);
+          const next = new Map(snapshot(name));
+          next.set(key, value);
+          writeCollectionFile(options.directory, file, next);
+          loaded.set(name, next);
         },
         async insertIfAbsent(key, value) {
           /* Atomic against this process only, which is precisely what
              DURABLE_SINGLE_WRITER promises and no more. */
-          const map = snapshot(name);
-          if (map.has(key)) return false;
-          map.set(key, value);
-          writeCollectionFile(options.directory, file, map);
+          const current = snapshot(name);
+          if (current.has(key)) return false;
+          const next = new Map(current);
+          next.set(key, value);
+          writeCollectionFile(options.directory, file, next);
+          loaded.set(name, next);
+          return true;
+        },
+        async insertAllIfAbsent(entries) {
+          const ordered = [...entries].sort((left, right) =>
+            compareCanonicalStrings(left.key, right.key),
+          );
+          const keys = new Set(ordered.map((entry) => entry.key));
+          if (keys.size !== ordered.length) {
+            throw new TypeError("Guard batch claims require unique keys.");
+          }
+          const current = snapshot(name);
+          if (ordered.some((entry) => current.has(entry.key))) return false;
+          const next = new Map(current);
+          for (const entry of ordered) next.set(entry.key, entry.value);
+          /* One collection map becomes one temp-file rename, so no caller or
+             cold-start reader can observe only half of this batch. */
+          writeCollectionFile(options.directory, file, next);
+          loaded.set(name, next);
           return true;
         },
         async delete(key) {
-          const map = snapshot(name);
-          if (!map.delete(key)) return;
-          writeCollectionFile(options.directory, file, map);
+          const current = snapshot(name);
+          if (!current.has(key)) return;
+          const next = new Map(current);
+          next.delete(key);
+          writeCollectionFile(options.directory, file, next);
+          loaded.set(name, next);
         },
         async has(key) {
           return snapshot(name).has(key);

@@ -1,12 +1,20 @@
 import { z } from "zod";
 
-import { hashCanonical } from "./service.ts";
+import { hashCanonical } from "./canonical.ts";
+import {
+  GUARD_AUTHORIZATION_STATUSES,
+  GUARD_EVIDENCE_STATUSES,
+  GUARD_EXECUTION_STATUSES,
+  GUARD_POLICY_DECISIONS,
+  GUARD_RECONCILIATION_STATUSES,
+} from "./status-values.ts";
 
 const DECIMAL_STRING = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
 const HEX_HASH = /^0x[0-9a-fA-F]{64}$/;
 const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const CAIP2 = /^[a-z0-9-]+:[A-Za-z0-9-]+$/;
 const ASSET_REF = /^[a-z0-9-]+:[A-Za-z0-9-]+\/[a-z0-9-]+:[A-Za-z0-9._%-]+$/;
+const ARC_EXPLORER_TRANSACTION = /^https:\/\/testnet\.arcscan\.app\/tx\/0x[0-9a-f]{64}$/;
 
 const decimalString = z.string().min(1).max(128).regex(DECIMAL_STRING);
 const timestamp = z.string().datetime({ offset: true });
@@ -36,6 +44,7 @@ export const ExecutionIntentSchema = z
     sellAssetRef: z.string().regex(ASSET_REF),
     buyAssetRef: z.string().regex(ASSET_REF),
     amount: decimalString,
+    leverage: decimalString.nullable().default(null),
     amountType: z.enum(["EXACT_INPUT", "EXACT_OUTPUT"]),
     recipient: z.string().regex(EVM_ADDRESS),
     venueRef: z.string().min(1).max(128),
@@ -415,6 +424,53 @@ export const GuardPolicySchema = z
   })
   .strict();
 
+/**
+ * Immutable, versioned output of deterministic policy evaluation.
+ *
+ * This is deliberately separate from evidence, authorization, execution and
+ * reconciliation. A consumer can therefore persist or validate the policy
+ * decision without treating it as permission to sign or proof of settlement.
+ */
+export const PolicyResultSchema = z
+  .object({
+    schemaVersion: z.literal("1.0.0"),
+    id: z.string().min(3).max(128),
+    intentId: z.string().min(3).max(128),
+    intentRevision: z.number().int().positive(),
+    policyRef: z
+      .object({
+        id: z.string().min(1).max(128),
+        version: z.number().int().positive(),
+      })
+      .strict(),
+    policyVersion: z.number().int().positive(),
+    policyDigest: z.string().regex(HEX_HASH),
+    evidenceRoot: z.string().regex(HEX_HASH),
+    evidenceRefs: z.array(z.string().min(3).max(128)).max(256),
+    decision: z.enum([
+      "ALLOWED_BY_POLICY",
+      "REVIEW_REQUIRED",
+      "BLOCKED_BY_RULE",
+      "INSUFFICIENT_EVIDENCE",
+      "UNSUPPORTED",
+      "EXPIRED",
+    ]),
+    status: z.enum(["PASS", "WARN", "BLOCK", "NOT_EVALUATED"]),
+    blockers: z.array(z.string().min(1).max(256)).max(128),
+    warnings: z.array(z.string().min(1).max(256)).max(128),
+    evaluatedAt: timestamp,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.policyRef.version !== value.policyVersion) {
+      context.addIssue({
+        code: "custom",
+        path: ["policyVersion"],
+        message: "Policy result version must match its bound policy reference.",
+      });
+    }
+  });
+
 export const ExecutionFingerprintSchema = z
   .object({
     schemaVersion: z.literal("1.0.0"),
@@ -431,6 +487,7 @@ export const ExecutionFingerprintSchema = z
     sellAssetRef: z.string().regex(ASSET_REF),
     buyAssetRef: z.string().regex(ASSET_REF),
     amount: decimalString,
+    leverage: decimalString.nullable().default(null),
     recipient: z.string().regex(EVM_ADDRESS),
     venueRef: z.string().min(1).max(128),
     routeRef: z.string().min(1).max(256),
@@ -474,6 +531,8 @@ export const HumanAuthorizationSchema = z
     intentHash: z.string().regex(HEX_HASH),
     evidenceRoot: z.string().regex(HEX_HASH),
     policyHash: z.string().regex(HEX_HASH),
+    policyVersion: z.number().int().positive(),
+    policyDigest: z.string().regex(HEX_HASH),
     preflightHash: z.string().regex(HEX_HASH),
     executionFingerprintHash: z.string().regex(HEX_HASH),
     materialWarningsShown: z.array(z.string().min(1).max(128)).max(64),
@@ -486,11 +545,25 @@ export const HumanAuthorizationSchema = z
   })
   .strict()
   .superRefine((value, context) => {
+    if (value.policyDigest !== value.policyHash) {
+      context.addIssue({
+        code: "custom",
+        path: ["policyDigest"],
+        message: "Authorization policy digest must match the bound policy hash.",
+      });
+    }
     if (Date.parse(value.expiresAt) <= Date.parse(value.createdAt)) {
       context.addIssue({
         code: "custom",
         path: ["expiresAt"],
         message: "Authorization expiry must follow creation.",
+      });
+    }
+    if (value.method === "EIP712" && value.signatureRef === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["signatureRef"],
+        message: "EIP-712 authorization requires a verified signature reference.",
       });
     }
   });
@@ -513,12 +586,7 @@ const ExpectedEffectsSchema = z
   })
   .strict();
 
-const ReconciliationStatusSchema = z.enum([
-  "NOT_RECONCILED",
-  "RECONCILIATION_REQUIRED",
-  "MATCHED",
-  "DEVIATION_RECORDED",
-]);
+const ReconciliationStatusSchema = z.enum(GUARD_RECONCILIATION_STATUSES);
 
 const ExecutionReferenceSchema = z
   .object({
@@ -551,7 +619,7 @@ export const ReadinessEnvelopeSchema = z
     policyDigest: z.string().regex(HEX_HASH),
     preflightHash: z.string().regex(HEX_HASH),
     dataStatus: z.enum(["COMPLETE", "PARTIAL", "INSUFFICIENT", "CONFLICTING", "UNAVAILABLE"]),
-    evidenceStatus: z.enum(["COMPLETE", "PARTIAL", "INSUFFICIENT", "CONFLICTING", "UNAVAILABLE"]),
+    evidenceStatus: z.enum(GUARD_EVIDENCE_STATUSES),
     outcome: z.enum([
       "ALLOWED_BY_POLICY",
       "REVIEW_REQUIRED",
@@ -560,35 +628,10 @@ export const ReadinessEnvelopeSchema = z
       "UNSUPPORTED",
       "EXPIRED",
     ]),
-    policyDecision: z.enum([
-      "ALLOWED_BY_POLICY",
-      "REVIEW_REQUIRED",
-      "BLOCKED_BY_RULE",
-      "INSUFFICIENT_EVIDENCE",
-      "UNSUPPORTED",
-      "EXPIRED",
-    ]),
+    policyDecision: z.enum(GUARD_POLICY_DECISIONS),
     policyStatus: z.enum(["PASS", "WARN", "BLOCK", "NOT_EVALUATED"]),
-    authorizationStatus: z.enum([
-      "NOT_REQUIRED",
-      "PENDING",
-      "APPROVED",
-      "REJECTED",
-      "EXPIRED",
-      "REVOKED",
-    ]),
-    executionStatus: z.enum([
-      "NOT_STARTED",
-      "SUBMITTED",
-      "SOURCE_CONFIRMED",
-      "IN_TRANSIT",
-      "DESTINATION_PENDING",
-      "CONFIRMED",
-      "FAILED",
-      "RECOVERY_REQUIRED",
-      "RECONCILIATION_REQUIRED",
-      "CANCELLED",
-    ]),
+    authorizationStatus: z.enum(GUARD_AUTHORIZATION_STATUSES),
+    executionStatus: z.enum(GUARD_EXECUTION_STATUSES),
     riskSignals: z.array(RiskSignalSchema).max(512),
     warnings: z.array(z.string().min(1).max(256)).max(128),
     blockers: z.array(z.string().min(1).max(256)).max(128),
@@ -639,24 +682,19 @@ const DecisionSettlementReconciliationEvidenceSchema = z
     provider: z.string().min(1).max(128),
     sourceRef: z.string().min(1).max(512),
     verificationStatus: z.enum(["PROVIDER_REPORTED", "ONCHAIN_VERIFIED"]),
+    observedAt: timestamp,
     responseDigest: z.string().regex(HEX_HASH),
   })
   .strict();
 
 export const DecisionSettlementReceiptSchema = z
   .object({
-    schemaVersion: z.literal("1.0.0"),
+    schemaVersion: z.enum(["1.0.0", "1.1.0"]),
     id: z.string().min(3).max(128),
     tenantId: z.string().min(3).max(128),
-    evidenceStatus: z.enum(["COMPLETE", "PARTIAL", "INSUFFICIENT", "CONFLICTING", "UNAVAILABLE"]),
-    policyDecision: z.enum([
-      "ALLOWED_BY_POLICY",
-      "REVIEW_REQUIRED",
-      "BLOCKED_BY_RULE",
-      "INSUFFICIENT_EVIDENCE",
-      "UNSUPPORTED",
-      "EXPIRED",
-    ]),
+    evidenceStatus: z.enum(GUARD_EVIDENCE_STATUSES),
+    policyDecision: z.enum(GUARD_POLICY_DECISIONS),
+    authorizationStatus: z.literal("APPROVED"),
     executionStatus: z.literal("CONFIRMED"),
     policyVersion: z.number().int().positive(),
     policyDigest: z.string().regex(HEX_HASH),
@@ -698,6 +736,8 @@ export const DecisionSettlementReceiptSchema = z
         method: z.enum(["PARTNER_AUTHENTICATED", "EIP712"]),
         subjectRef: z.string().min(1).max(256),
         createdAt: timestamp,
+        expiresAt: timestamp.optional(),
+        executionFingerprintHash: z.string().regex(HEX_HASH).optional(),
       })
       .strict(),
     execution: z
@@ -708,7 +748,7 @@ export const DecisionSettlementReceiptSchema = z
         productionCalldataBound: z.boolean(),
         transactionHash: z.string().regex(HEX_HASH),
         status: z.literal("CONFIRMED"),
-        explorerUrl: z.string().url(),
+        explorerUrl: z.string().url().regex(ARC_EXPLORER_TRANSACTION),
       })
       .strict(),
     reconciliation: z
@@ -738,6 +778,47 @@ export const DecisionSettlementReceiptSchema = z
   })
   .strict()
   .superRefine((value, context) => {
+    if (value.schemaVersion === "1.1.0") {
+      const authorizationExpiry = value.authorization.expiresAt;
+      const authorizationFingerprint = value.authorization.executionFingerprintHash;
+      if (!authorizationExpiry) {
+        context.addIssue({
+          code: "custom",
+          path: ["authorization", "expiresAt"],
+          message: "Receipt v1.1 requires the authorization expiry.",
+        });
+      }
+      if (!authorizationFingerprint) {
+        context.addIssue({
+          code: "custom",
+          path: ["authorization", "executionFingerprintHash"],
+          message: "Receipt v1.1 requires the authorized execution fingerprint hash.",
+        });
+      }
+      if (
+        authorizationFingerprint &&
+        authorizationFingerprint !== value.execution.fingerprintHash
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["authorization", "executionFingerprintHash"],
+          message: "Receipt authorization and execution fingerprint hashes must match.",
+        });
+      }
+      if (authorizationExpiry) {
+        const createdAt = Date.parse(value.authorization.createdAt);
+        const observedAt = Date.parse(value.reconciliation.evidence.observedAt);
+        const expiresAt = Date.parse(authorizationExpiry);
+        const finalizedAt = Date.parse(value.finalizedAt);
+        if (!(createdAt <= observedAt && observedAt <= expiresAt && observedAt <= finalizedAt)) {
+          context.addIssue({
+            code: "custom",
+            path: ["reconciliation", "evidence", "observedAt"],
+            message: "Receipt observation must fall within authorization and precede finalization.",
+          });
+        }
+      }
+    }
     const relationshipsMatch =
       value.policyVersion === value.policy.version &&
       value.policyDigest === value.policy.hash &&
@@ -750,6 +831,15 @@ export const DecisionSettlementReceiptSchema = z
       context.addIssue({
         code: "custom",
         message: "Receipt summary fields must match their attributed lifecycle records.",
+      });
+    }
+    const expectedExplorerUrl =
+      `https://testnet.arcscan.app/tx/${value.execution.transactionHash.toLowerCase()}`;
+    if (value.execution.explorerUrl !== expectedExplorerUrl) {
+      context.addIssue({
+        code: "custom",
+        path: ["execution", "explorerUrl"],
+        message: "Receipt explorer URL must match the execution transaction hash.",
       });
     }
     const { receiptHash, integrity, ...receiptCore } = value;

@@ -11,6 +11,30 @@ export type RyntraGuardClientOptions = {
   createCorrelationId?: () => string;
 };
 
+export type RyntraGuardActualOutcome = {
+  amountIn: string;
+  amountOut: string;
+  feeAmount: string;
+  explorerUrl: string;
+};
+
+type RyntraGuardReconcileBase = {
+  intentId: string;
+  transactionHash: string;
+};
+
+export type RyntraGuardReconcileInput =
+  | (RyntraGuardReconcileBase & {
+      observedState: "CONFIRMED";
+      observedAt: string;
+      actualOutcome: RyntraGuardActualOutcome;
+    })
+  | (RyntraGuardReconcileBase & {
+      observedState: "RPC_UNCERTAIN_AFTER_BROADCAST";
+      observedAt?: string;
+      actualOutcome?: RyntraGuardActualOutcome;
+    });
+
 type GuardErrorBody = {
   error?: {
     code?: string;
@@ -55,6 +79,14 @@ function defaultCorrelationId(): string {
 function identifier(value: string): string {
   if (!/^[A-Za-z0-9_-]{3,128}$/.test(value)) throw new TypeError("Invalid Guard identifier.");
   return encodeURIComponent(value);
+}
+
+function intentListPath(limit?: number): string {
+  if (limit === undefined) return "/v1/intents";
+  if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+    throw new TypeError("Guard intent list limit must be an integer from 1 to 200.");
+  }
+  return `/v1/intents?${new URLSearchParams({ limit: String(limit) })}`;
 }
 
 export class RyntraGuardClient {
@@ -134,6 +166,10 @@ export class RyntraGuardClient {
     ) => this.request<T>("/v1/intents", { method: "POST", body: input, options }),
     get: <T = Record<string, unknown>>(intentId: string, options?: RyntraGuardRequestOptions) =>
       this.request<T>(`/v1/intents/${identifier(intentId)}`, { options }),
+    list: <T = Record<string, unknown>>(
+      query: { limit?: number } = {},
+      options?: RyntraGuardRequestOptions,
+    ) => this.request<T>(intentListPath(query.limit), { options }),
   };
 
   readonly preflight = <T = Record<string, unknown>>(
@@ -160,7 +196,7 @@ export class RyntraGuardClient {
       evaluationId: string;
       fingerprint: unknown;
       subjectRef: string;
-      method: "PARTNER_AUTHENTICATED" | "EIP712";
+      method: "PARTNER_AUTHENTICATED";
     },
     options: RyntraGuardRequestOptions,
   ) => {
@@ -190,17 +226,7 @@ export class RyntraGuardClient {
       });
     },
     reconcile: <T = Record<string, unknown>>(
-      input: {
-        intentId: string;
-        transactionHash: string;
-        observedState: "RPC_UNCERTAIN_AFTER_BROADCAST" | "CONFIRMED";
-        actualOutcome?: {
-          amountIn: string;
-          amountOut: string;
-          feeAmount: string;
-          explorerUrl: string;
-        };
-      },
+      input: RyntraGuardReconcileInput,
       options: RyntraGuardRequestOptions,
     ) => {
       const { intentId, ...reconciliation } = input;

@@ -56,6 +56,87 @@ export const ARC_USDC_TRANSFER_POLICY = GuardPolicySchema.parse({
   ],
 });
 
+const ARC_USDC_TRANSFER_VENUE = "arc-testnet-eoa";
+const ARC_USDC_TRANSFER_ROUTE = "arc-usdc-erc20:eoa-transfer";
+
+export function assertArcUsdcTransferPolicyBinding({
+  intent,
+  evidence,
+}: {
+  intent: Record<string, unknown>;
+  evidence: Array<Record<string, unknown>>;
+}): void {
+  const transferPlans = evidence.filter((entry) => entry.sourceType === "TRANSFER_PLAN");
+  const plan = transferPlans.length === 1 ? transferPlans[0] : null;
+  const facts =
+    plan?.facts && typeof plan.facts === "object" && !Array.isArray(plan.facts)
+      ? (plan.facts as Record<string, unknown>)
+      : null;
+  let recipient: `0x${string}`;
+  let amountBaseUnits: bigint;
+  try {
+    recipient = parseAddress(String(intent.recipient ?? ""), "Recipient");
+    amountBaseUnits = arcUsdcAmountToBaseUnits(String(intent.amount ?? ""), "ERC20");
+  } catch {
+    throw new GuardError(
+      "FINGERPRINT_MISMATCH",
+      "Arc transfer intent cannot be bound to the server-owned transfer policy.",
+    );
+  }
+  const expectedCalldata = encodeFunctionData({
+    abi: ERC20_ABI,
+    functionName: "transfer",
+    args: [recipient, amountBaseUnits],
+  });
+  const expectedCalldataHash = keccak256(expectedCalldata).toLowerCase();
+  const tokenAddress = ARC_USDC_INTERFACES.ERC20.address.toLowerCase();
+  const usdcAssetRef = ARC_TESTNET.usdcAssetRef.toLowerCase();
+  const policyRef =
+    intent.policyRef && typeof intent.policyRef === "object" && !Array.isArray(intent.policyRef)
+      ? (intent.policyRef as Record<string, unknown>)
+      : null;
+  if (
+    amountBaseUnits <= 0n ||
+    intent.actionType !== "SEND" ||
+    intent.walletType !== "EOA" ||
+    intent.chainRef !== ARC_TESTNET.chainRef ||
+    String(intent.sellAssetRef ?? "").toLowerCase() !== usdcAssetRef ||
+    String(intent.buyAssetRef ?? "").toLowerCase() !== usdcAssetRef ||
+    intent.executionBindingKind !== "EVM_TRANSACTION" ||
+    intent.productionCalldataBound !== true ||
+    String(intent.target ?? "").toLowerCase() !== tokenAddress ||
+    String(intent.calldataHash ?? "").toLowerCase() !== expectedCalldataHash ||
+    compareDecimalStrings(String(intent.nativeValue ?? ""), "0") !== 0 ||
+    intent.venueRef !== ARC_USDC_TRANSFER_VENUE ||
+    intent.routeRef !== ARC_USDC_TRANSFER_ROUTE ||
+    policyRef?.id !== ARC_USDC_TRANSFER_POLICY.id ||
+    policyRef.version !== ARC_USDC_TRANSFER_POLICY.version ||
+    !plan ||
+    plan.provider !== "Arc Testnet JSON-RPC" ||
+    plan.adapter !== "ryntra-arc-usdc-transfer" ||
+    plan.transformationVersion !== "arc-usdc-eoa-transfer-v1" ||
+    plan.verificationStatus !== "ONCHAIN_VERIFIED" ||
+    plan.fallbackUsed !== true ||
+    plan.chainRef !== ARC_TESTNET.chainRef ||
+    !facts ||
+    String(facts.tokenAddress ?? "").toLowerCase() !== tokenAddress ||
+    String(facts.calldataHash ?? "").toLowerCase() !== expectedCalldataHash ||
+    String(facts.sellAssetRef ?? "").toLowerCase() !== usdcAssetRef ||
+    String(facts.buyAssetRef ?? "").toLowerCase() !== usdcAssetRef ||
+    facts.venueRef !== ARC_USDC_TRANSFER_VENUE ||
+    facts.routeRef !== ARC_USDC_TRANSFER_ROUTE ||
+    String(facts.recipientAddress ?? "").toLowerCase() !== recipient ||
+    compareDecimalStrings(String(facts.amountIn ?? ""), String(intent.amount ?? "")) !== 0 ||
+    facts.tokenDecimals !== "6" ||
+    facts.nativeDecimals !== "18"
+  ) {
+    throw new GuardError(
+      "FINGERPRINT_MISMATCH",
+      "Arc transfer intent or evidence differs from the server-owned ERC-20 transfer binding.",
+    );
+  }
+}
+
 export type ArcUsdcTransferRequest = {
   walletType: "EOA" | "SMART_ACCOUNT" | "SAFE" | "ERC4337" | "OTHER";
   walletAddress: string;
@@ -200,7 +281,7 @@ export async function prepareArcUsdcTreasuryTransfer({
     if (error instanceof ArcUsdcTransferError) throw error;
     throw new ArcUsdcTransferError(
       "ARC_TRANSFER_EVIDENCE_UNAVAILABLE",
-      `Arc Testnet RPC evidence is unavailable at ${resolveArcTestnetRpcUrl()}; transfer authorization remains blocked. Set ARC_TESTNET_RPC_URL to an HTTPS endpoint this server can actually reach.`,
+      "Arc Testnet RPC evidence is unavailable from the configured endpoint; transfer authorization remains blocked. Verify the server-side ARC_TESTNET_RPC_URL configuration.",
     );
   }
   if (state.chainId !== 5_042_002) {
@@ -226,7 +307,14 @@ export async function prepareArcUsdcTreasuryTransfer({
     );
   }
   const gasFeeBaseUnits = gasLimit * gasPrice;
-  if (tokenBalance < amountBaseUnits || nativeBalance < gasFeeBaseUnits) {
+  /* Arc exposes one underlying USDC balance through a 6-decimal ERC-20 view
+     and an 18-decimal native view. Reserving each leg independently double
+     counts that balance: 1 USDC can satisfy both comparisons while 1 USDC plus
+     gas cannot actually settle. Normalize the transfer into native units and
+     reserve the combined debit before authorization. */
+  const economicAmountBaseUnits = amountBaseUnits * 10n ** 12n;
+  const totalDebitBaseUnits = economicAmountBaseUnits + gasFeeBaseUnits;
+  if (tokenBalance < amountBaseUnits || nativeBalance < totalDebitBaseUnits) {
     throw new ArcUsdcTransferError(
       "ARC_TRANSFER_INSUFFICIENT_BALANCE",
       "The EOA lacks confirmed ERC-20 USDC or native Arc USDC for the planned transfer and gas.",
@@ -242,8 +330,7 @@ export async function prepareArcUsdcTreasuryTransfer({
   const observedAt = now();
   const validUntil = new Date(Date.parse(observedAt) + 120_000).toISOString();
   const nativeFeeAmount = arcUsdcBaseUnitsToAmount(gasFeeBaseUnits, "NATIVE");
-  const economicAmountBaseUnits = amountBaseUnits * 10n ** 12n;
-  const totalDebit = arcUsdcBaseUnitsToAmount(economicAmountBaseUnits + gasFeeBaseUnits, "NATIVE");
+  const totalDebit = arcUsdcBaseUnitsToAmount(totalDebitBaseUnits, "NATIVE");
   if (compareDecimalStrings(totalDebit, request.amount) === -1) {
     throw new ArcUsdcTransferError("ARC_TRANSFER_INVALID", "Transfer debit normalization failed.");
   }
@@ -302,17 +389,20 @@ export async function prepareArcUsdcTreasuryTransfer({
     facts: {
       quoteRef,
       providerRef: "arc-testnet-json-rpc",
-      routeRef: "arc-usdc-erc20:eoa-transfer",
+      venueRef: ARC_USDC_TRANSFER_VENUE,
+      routeRef: ARC_USDC_TRANSFER_ROUTE,
       sellAssetRef: ARC_TESTNET.usdcAssetRef,
       buyAssetRef: ARC_TESTNET.usdcAssetRef,
       amountIn: request.amount,
+      recipientAddress,
+      leverage: null,
       expectedAmountOut: request.amount,
       minimumAmountOut: request.amount,
       feeAmount: nativeFeeAmount,
+      feeAssetRef: ARC_TESTNET.usdcAssetRef,
       feeAssetInterface: "NATIVE_USDC_18_DECIMALS",
       totalDebit,
       slippageBps: "0",
-      recipientAddress,
       tokenAddress,
       calldataHash,
       tokenDecimals: "6",
@@ -377,7 +467,7 @@ export function buildArcUsdcTransferIntent({
     amount: prepared.request.amount,
     amountType: "EXACT_INPUT",
     recipient: prepared.request.recipientAddress,
-    venueRef: "arc-testnet-eoa",
+    venueRef: ARC_USDC_TRANSFER_VENUE,
     routeRef: String(prepared.evidence.facts.routeRef),
     quoteRef: String(prepared.evidence.facts.quoteRef),
     executionBindingKind: "EVM_TRANSACTION",
@@ -399,6 +489,7 @@ export function buildArcUsdcTransferIntent({
 }
 
 export type ArcUsdcTransactionState = {
+  chainId: number | null;
   transactionFound: boolean;
   receiptFound: boolean;
   receiptStatus: "success" | "reverted" | null;
@@ -411,6 +502,7 @@ export type ArcUsdcTransactionState = {
   transferAmountBaseUnits: string | null;
   gasUsed: string | null;
   effectiveGasPriceBaseUnits: string | null;
+  blockTimestamp: string | null;
 };
 
 export type ArcUsdcTransactionCollector = (transactionHash: `0x${string}`) => Promise<ArcUsdcTransactionState>;
@@ -422,10 +514,12 @@ export async function collectArcUsdcTransactionState(
     transport: http(resolveArcTestnetRpcUrl(), { timeout: 12_000 }),
   });
   try {
-    const [transaction, receipt] = await Promise.all([
+    const [chainId, transaction, receipt] = await Promise.all([
+      client.getChainId(),
       client.getTransaction({ hash: transactionHash }),
       client.getTransactionReceipt({ hash: transactionHash }),
     ]);
+    const block = await client.getBlock({ blockNumber: receipt.blockNumber });
     const transferLog = receipt.logs
       .filter((log) => log.address.toLowerCase() === ARC_USDC_INTERFACES.ERC20.address)
       .map((log) => {
@@ -440,6 +534,7 @@ export async function collectArcUsdcTransactionState(
       | { from?: `0x${string}`; to?: `0x${string}`; value?: bigint }
       | undefined;
     return {
+      chainId,
       transactionFound: true,
       receiptFound: true,
       receiptStatus: receipt.status,
@@ -452,9 +547,11 @@ export async function collectArcUsdcTransactionState(
       transferAmountBaseUnits: args?.value?.toString() ?? null,
       gasUsed: receipt.gasUsed.toString(),
       effectiveGasPriceBaseUnits: receipt.effectiveGasPrice.toString(),
+      blockTimestamp: new Date(Number(block.timestamp) * 1_000).toISOString(),
     };
   } catch {
     return {
+      chainId: null,
       transactionFound: false,
       receiptFound: false,
       receiptStatus: null,
@@ -467,6 +564,7 @@ export async function collectArcUsdcTransactionState(
       transferAmountBaseUnits: null,
       gasUsed: null,
       effectiveGasPriceBaseUnits: null,
+      blockTimestamp: null,
     };
   }
 }
@@ -493,6 +591,12 @@ export async function reconcileArcUsdcTreasuryTransfer({
   if (!state.transactionFound || !state.receiptFound) {
     return { observedState: "RPC_UNCERTAIN_AFTER_BROADCAST" as const };
   }
+  if (state.chainId !== ARC_TESTNET.chainId) {
+    throw new GuardError(
+      "FINGERPRINT_MISMATCH",
+      "Reconciliation RPC is not connected to the authorized Arc chain.",
+    );
+  }
   if (state.receiptStatus !== "success") {
     throw new GuardError("RECONCILIATION_REQUIRED", "Arc transaction reverted or lacks success evidence.", {
       requiredAction: "REVIEW_ARC_TRANSACTION",
@@ -508,6 +612,7 @@ export async function reconcileArcUsdcTreasuryTransfer({
     state.transferAmountBaseUnits === null ||
     state.gasUsed === null ||
     state.effectiveGasPriceBaseUnits === null ||
+    state.blockTimestamp === null ||
     !intent.target ||
     !intent.calldataHash
   ) {
@@ -532,6 +637,7 @@ export async function reconcileArcUsdcTreasuryTransfer({
     parseUnsignedInteger(state.effectiveGasPriceBaseUnits, "Effective gas price");
   return {
     observedState: "CONFIRMED" as const,
+    observedAt: state.blockTimestamp,
     actualOutcome: {
       amountIn: intent.amount,
       amountOut: intent.amount,

@@ -176,17 +176,22 @@ export async function estimateArcSwapForDemo({
     );
   }
   const receivedAt = now();
+  const normalizedEvidence = normalizeArcSwapEstimate({
+    request,
+    estimate,
+    observedAt,
+    receivedAt,
+    freshnessSeconds: 120,
+  });
+  const binding = createArcAppKitRequestBinding(request, estimate);
   return {
     request,
     estimate,
-    evidence: normalizeArcSwapEstimate({
-      request,
-      estimate,
-      observedAt,
-      receivedAt,
-      freshnessSeconds: 120,
-    }),
-    binding: createArcAppKitRequestBinding(request, estimate),
+    evidence: {
+      ...normalizedEvidence,
+      facts: { ...normalizedEvidence.facts, bindingHash: binding.hash },
+    },
+    binding,
   };
 }
 

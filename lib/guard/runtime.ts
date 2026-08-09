@@ -42,6 +42,11 @@ export function resolveGuardDeployment(env: GuardEnv): GuardDeploymentShape {
   const declared = env.RYNTRA_GUARD_DEPLOYMENT?.trim().toLowerCase();
   if (declared === "multi-instance") return "MULTI_INSTANCE";
   if (declared === "single-instance") return "SINGLE_INSTANCE";
+  if (declared) {
+    throw new Error(
+      `Unsupported RYNTRA_GUARD_DEPLOYMENT value: ${declared}. Expected single-instance or multi-instance.`,
+    );
+  }
   return env.VERCEL ? "MULTI_INSTANCE" : "SINGLE_INSTANCE";
 }
 
@@ -64,6 +69,11 @@ export function resolveGuardStore(env: GuardEnv): GuardStore {
       );
     }
     return createFileGuardStore({ directory });
+  }
+  if (kind && kind !== "memory") {
+    throw new Error(
+      `Unsupported RYNTRA_GUARD_STORE value: ${kind}. Expected memory, file, or postgres.`,
+    );
   }
   return createMemoryGuardStore();
 }

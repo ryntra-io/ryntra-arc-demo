@@ -1,5 +1,7 @@
 import { Pool, type PoolConfig } from "pg";
 
+import { compareCanonicalStrings } from "./canonical.ts";
+
 import {
   GUARD_COLLECTIONS,
   type GuardCollection,
@@ -33,7 +35,7 @@ const TABLE = "guard_objects";
 export type PostgresGuardStoreOptions = {
   connectionString: string;
   /** Overrides for tests or an operator with unusual pool requirements. */
-  poolConfig?: Omit<PoolConfig, "connectionString">;
+  poolConfig?: Omit<PoolConfig, "connectionString" | "ssl">;
 };
 
 function isLocalConnection(connectionString: string): boolean {
@@ -45,58 +47,75 @@ function isLocalConnection(connectionString: string): boolean {
   }
 }
 
-export function createPostgresGuardStore(options: PostgresGuardStoreOptions): GuardStore {
+const CONNECTION_STRING_TLS_PARAMETERS = new Set([
+  "ssl",
+  "sslmode",
+  "sslcert",
+  "sslkey",
+  "sslrootcert",
+  "uselibpqcompat",
+]);
+
+function normalizeRemoteConnectionString(connectionString: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(connectionString);
+  } catch {
+    throw new Error("A Postgres Guard store requires a valid absolute connection string.");
+  }
+  if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
+    throw new Error("A Postgres Guard store requires a postgres:// or postgresql:// URL.");
+  }
+  if (["localhost", "127.0.0.1", "::1"].includes(parsed.hostname)) return connectionString;
+  for (const key of [...parsed.searchParams.keys()]) {
+    if (CONNECTION_STRING_TLS_PARAMETERS.has(key.toLowerCase())) {
+      parsed.searchParams.delete(key);
+    }
+  }
+  return parsed.toString();
+}
+
+export function postgresGuardPoolConfig(options: PostgresGuardStoreOptions): PoolConfig {
   const { connectionString } = options;
   if (!connectionString.trim()) {
     throw new Error("A Postgres Guard store requires a non-empty connection string.");
   }
-
-  const pool = new Pool({
-    /* TLS is verified against the system trust store, which every managed
-       Postgres provider's certificate chains to. Turning verification off is
-       the usual shortcut here and it is the wrong one: this connection carries
-       the authorization and settlement record, so an unverified peer would let
-       an attacker on the path read and rewrite the evidence this whole system
-       exists to preserve. A local database speaks plaintext and gets no TLS
-       config at all — demanding it there breaks development for no gain. */
-    ssl: isLocalConnection(connectionString) ? undefined : true,
-    connectionString,
-    /* `ssl: true` above is set explicitly rather than left to the connection
-       string. Managed providers append `sslmode=require`, which pg 8 currently
-       treats as full verification — but pg 9 will change that alias to libpq
-       semantics, where `require` encrypts without verifying the peer. Passing
-       the flag here keeps verification on through that change instead of
-       silently weakening the connection that carries the authorization and
-       settlement record. */
+  const local = isLocalConnection(connectionString);
+  return {
     max: 4,
     idleTimeoutMillis: 10_000,
     connectionTimeoutMillis: 10_000,
     ...options.poolConfig,
-  });
+    /* pg parses connectionString after object fields. Keep these fields
+       security-owned even for untyped JavaScript callers. */
+    connectionString: normalizeRemoteConnectionString(connectionString),
+    ssl: local ? undefined : { rejectUnauthorized: true },
+  };
+}
 
-  /* One migration, run once per process and awaited by every caller that races
+export function createPostgresGuardStore(options: PostgresGuardStoreOptions): GuardStore {
+  /* Remote connections always use verified TLS against the system trust store.
+     URL TLS flags are normalized out before pg can override this object. */
+  const pool = new Pool(postgresGuardPoolConfig(options));
+
+  /* Readiness is checked once per process and awaited by every caller that races
      it. A store that silently served reads before its table existed would fail
      as "no rows" — indistinguishable from a genuinely absent lifecycle, which
-     is the one error this system must never fake. */
+     is the one error this system must never fake. Runtime requests never run
+     DDL; provisioning is a separately authorized migration. */
   let ready: Promise<void> | null = null;
   function ensureReady(): Promise<void> {
     ready ??= pool
-      .query(
-        `CREATE TABLE IF NOT EXISTS ${TABLE} (
-           collection text NOT NULL,
-           key        text NOT NULL,
-           value      jsonb NOT NULL,
-           created_at timestamptz NOT NULL DEFAULT now(),
-           updated_at timestamptz NOT NULL DEFAULT now(),
-           PRIMARY KEY (collection, key)
-         )`,
-      )
+      .query(`SELECT collection, key, value FROM ${TABLE} LIMIT 0`)
       .then(() => undefined)
       .catch((error: unknown) => {
         /* Clear the memo so a transient failure at startup does not poison the
            process for its whole life. */
         ready = null;
-        throw error;
+        throw new Error(
+          "Postgres Guard schema is unavailable; apply the separately authorized guard_objects migration first.",
+          { cause: error },
+        );
       });
     return ready;
   }
@@ -130,6 +149,45 @@ export function createPostgresGuardStore(options: PostgresGuardStoreOptions): Gu
           [name, key, JSON.stringify(value)],
         );
         return (result.rowCount ?? 0) === 1;
+      },
+
+      async insertAllIfAbsent(entries) {
+        await ensureReady();
+        const ordered = [...entries].sort((left, right) =>
+          compareCanonicalStrings(left.key, right.key),
+        );
+        const keys = new Set(ordered.map((entry) => entry.key));
+        if (keys.size !== ordered.length) {
+          throw new TypeError("Guard batch claims require unique keys.");
+        }
+        if (ordered.length === 0) return true;
+
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          for (const entry of ordered) {
+            const result = await client.query(
+              `INSERT INTO ${TABLE} (collection, key, value) VALUES ($1, $2, $3)
+               ON CONFLICT (collection, key) DO NOTHING`,
+              [name, entry.key, JSON.stringify(entry.value)],
+            );
+            if ((result.rowCount ?? 0) !== 1) {
+              await client.query("ROLLBACK");
+              return false;
+            }
+          }
+          await client.query("COMMIT");
+          return true;
+        } catch (error) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {
+            // Preserve the original transaction error.
+          }
+          throw error;
+        } finally {
+          client.release();
+        }
       },
 
       async delete(key) {

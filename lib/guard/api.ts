@@ -7,6 +7,8 @@ import {
   ExecutionIntentSchema,
   GuardPolicySchema,
 } from "./contracts.ts";
+import { ARC_RECORDED_RUN } from "./recorded-run.ts";
+import { getArcVerificationStatus } from "./arc-verification.ts";
 import { GuardError } from "./service.ts";
 
 export const GUARD_MAX_BODY_BYTES = 64 * 1024;
@@ -109,12 +111,33 @@ export async function readBoundedGuardJson(request: Request): Promise<unknown> {
   if (contentType !== "application/json") throw validationError("Content-Type must be application/json.");
   const declaredLength = request.headers.get("content-length");
   if (declaredLength && /^\d+$/.test(declaredLength) && Number(declaredLength) > GUARD_MAX_BODY_BYTES) {
+    await request.body?.cancel("Guard request body exceeds the prototype limit.").catch(() => undefined);
     throw validationError("Request body exceeds the Guard prototype limit.");
   }
-  const raw = await request.text();
-  if (new TextEncoder().encode(raw).byteLength > GUARD_MAX_BODY_BYTES) {
-    throw validationError("Request body exceeds the Guard prototype limit.");
+
+  const reader = request.body?.getReader();
+  const chunks: Uint8Array[] = [];
+  let receivedBytes = 0;
+  if (reader) {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      receivedBytes += value.byteLength;
+      if (receivedBytes > GUARD_MAX_BODY_BYTES) {
+        await reader.cancel("Guard request body exceeds the prototype limit.").catch(() => undefined);
+        throw validationError("Request body exceeds the Guard prototype limit.");
+      }
+      chunks.push(value);
+    }
   }
+
+  const bytes = new Uint8Array(receivedBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  const raw = new TextDecoder().decode(bytes);
   try {
     return JSON.parse(raw) as unknown;
   } catch {
@@ -178,12 +201,13 @@ export const AuthorizeRequestSchema = z
     evaluationId: z.string().min(3).max(128),
     fingerprint: ExecutionFingerprintSchema,
     subjectRef: z.string().min(1).max(256),
-    method: z.enum(["PARTNER_AUTHENTICATED", "EIP712"]),
+    method: z.literal("PARTNER_AUTHENTICATED"),
   })
   .strict();
 
 const TRANSACTION_HASH = /^0x[0-9a-fA-F]{64}$/;
 const FINANCIAL_DECIMAL = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
+const ARC_EXPLORER_TRANSACTION = /^https:\/\/testnet\.arcscan\.app\/tx\/0x[0-9a-f]{64}$/;
 
 export const RecordExecutionRequestSchema = z
   .object({
@@ -199,20 +223,35 @@ export const ReconcileExecutionRequestSchema = z
     operation: z.literal("RECONCILE"),
     transactionHash: z.string().regex(TRANSACTION_HASH),
     observedState: z.enum(["RPC_UNCERTAIN_AFTER_BROADCAST", "CONFIRMED"]),
+    observedAt: z.string().datetime({ offset: true }).optional(),
     actualOutcome: z
       .object({
-        amountIn: z.string().regex(FINANCIAL_DECIMAL),
-        amountOut: z.string().regex(FINANCIAL_DECIMAL),
-        feeAmount: z.string().regex(FINANCIAL_DECIMAL),
-        explorerUrl: z.string().url().startsWith("https://testnet.arcscan.app/tx/"),
+        amountIn: z.string().max(128).regex(FINANCIAL_DECIMAL),
+        amountOut: z.string().max(128).regex(FINANCIAL_DECIMAL),
+        feeAmount: z.string().max(128).regex(FINANCIAL_DECIMAL),
+        explorerUrl: z.string().url().regex(ARC_EXPLORER_TRANSACTION),
       })
       .strict()
       .optional(),
   })
   .strict()
   .superRefine((value, context) => {
-    if (value.observedState === "CONFIRMED" && !value.actualOutcome) {
-      context.addIssue({ code: "custom", path: ["actualOutcome"], message: "Required for confirmation." });
+    if (value.observedState === "CONFIRMED") {
+      if (!value.actualOutcome) {
+        context.addIssue({ code: "custom", path: ["actualOutcome"], message: "Required for confirmation." });
+      }
+      if (!value.observedAt) {
+        context.addIssue({ code: "custom", path: ["observedAt"], message: "Required for confirmation." });
+      }
+      const expectedExplorerUrl =
+        `https://testnet.arcscan.app/tx/${value.transactionHash.toLowerCase()}`;
+      if (value.actualOutcome && value.actualOutcome.explorerUrl !== expectedExplorerUrl) {
+        context.addIssue({
+          code: "custom",
+          path: ["actualOutcome", "explorerUrl"],
+          message: "Explorer URL must match the transactionHash exactly.",
+        });
+      }
     }
   });
 
@@ -246,7 +285,7 @@ export const ARC_DEMO_POLICY = GuardPolicySchema.parse({
   ],
 });
 
-export const guardCapabilities = Object.freeze([
+const BASE_GUARD_CAPABILITIES = [
   {
     id: "guard-kernel-v1",
     state: "TESTNET_ONLY",
@@ -262,10 +301,11 @@ export const guardCapabilities = Object.freeze([
     state: "TESTNET_ONLY",
     environment: "ARC_TESTNET",
     protocolCapability: "NOT_APPLICABLE",
-    ryntraImplementationCapability: "IMPLEMENTED_NOT_DEPLOYED",
+    ryntraImplementationCapability: "SOURCE_IMPLEMENTED_DEPLOYMENT_PARITY_UNVERIFIED",
     currentWalletCapability: "NOT_APPLICABLE",
-    verifiedAt: null,
-    evidenceSource: "source-only",
+    verifiedAt: "2026-08-08",
+    evidenceSource:
+      "https://ryntra-arc-testnet.vercel.app/v1/capabilities exists; corrected source parity and deployed SHA are unverified; SDK is not published to npm",
   },
   {
     id: "arc-app-kit-usdc-eurc-swap",
@@ -279,16 +319,36 @@ export const guardCapabilities = Object.freeze([
   },
   {
     id: "arc-eoa-usdc-transfer",
-    state: "TESTNET_ONLY",
+    state: "TESTNET_VERIFIED",
     environment: "ARC_TESTNET",
     protocolCapability: "DOCUMENTED_BY_PROVIDER",
-    ryntraImplementationCapability: "VERIFIED_BY_DETERMINISTIC_TESTS_NOT_LIVE",
-    currentWalletCapability: "UNVERIFIED",
-    verifiedAt: null,
-    evidenceSource:
-      "official Arc chain/token configuration and source tests; live transaction absent",
+    ryntraImplementationCapability: "TESTNET_VERIFIED_ONE_RECORDED_RUN",
+    currentWalletCapability: "RECORDED_OWNER_WALLET_ONLY",
+    verifiedAt: ARC_RECORDED_RUN.blockTimestamp,
+    evidenceSource: `${ARC_RECORDED_RUN.explorerUrl}; direct-EOA ERC-20 USDC transfer only; App Kit swap not executed`,
   },
-] as const);
+] as const;
+
+/** Current machine-readable capability projection with registry freshness. */
+export function getGuardCapabilities(now = new Date()) {
+  const arcStatus = getArcVerificationStatus(now);
+  return Object.freeze(
+    BASE_GUARD_CAPABILITIES.map((entry) =>
+      entry.id === "arc-eoa-usdc-transfer"
+        ? {
+            ...entry,
+            state: arcStatus.state,
+            ryntraImplementationCapability: arcStatus.isCurrent
+              ? "TESTNET_VERIFIED_ONE_RECORDED_RUN"
+              : "RE_VERIFYING_RECORDED_RUN",
+          }
+        : { ...entry },
+    ),
+  );
+}
+
+/** Compatibility snapshot for source consumers; HTTP routes resolve per request. */
+export const guardCapabilities = getGuardCapabilities();
 
 const STATUS_BY_CODE: Record<GuardApiErrorCode, number> = {
   VALIDATION_ERROR: 400,

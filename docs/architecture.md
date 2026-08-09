@@ -2,7 +2,7 @@
 
 ## Product boundary
 
-Ryntra Guard is a provider-neutral **Decision & Settlement Evidence Layer for programmable money**. It normalizes a financial intent, records required and available evidence with provenance and freshness, evaluates versioned financial policies, preserves the user-authorization boundary, and reconciles expected effects with the final onchain result. Ryntra Workspace is its reference client. Arc is the first specialist pack and submission environment. Arcus remains a separate execution adapter and the current verified venue path.
+Ryntra Guard is a provider-neutral **Decision & Settlement Evidence Layer for programmable money**. It normalizes a financial intent, records required and available evidence with provenance and freshness, evaluates versioned financial policies, preserves the user-authorization boundary, and reconciles expected effects with the final onchain result. Ryntra Workspace is its reference client. Arc is the current specialist pack and submission environment. Arcus remains a separate execution adapter and the current verified venue path.
 
 The existing exact-input USDC-to-EURC App Kit path remains intact and is not rewritten for presentation. Because it is not confirmed end-to-end, the source also exposes one bounded fallback: a direct-EOA ERC-20 USDC treasury transfer on Arc Testnet. The fallback is labelled as a transfer, never a swap, and uses an exact target/calldata/value fingerprint.
 
@@ -10,20 +10,18 @@ This layer is not presented as the first transaction firewall, the first policy 
 
 ## Current request path
 
+The anonymous `/api/arc-guard` demo exposes estimates and unsigned preflight material only. It cannot create partner authorization, record execution, or reconcile a transaction; those lifecycle mutations require the authenticated `/v1` partner API. An HttpOnly demo cookie isolates browser state but is neither partner authentication nor proof of wallet ownership.
+
 ```text
-Partner reference client (/arc-guard)
+Public reference client (/arc/demo; /arc-guard is a permanent redirect)
   -> same-origin demo session (HttpOnly, SameSite=Strict)
   -> choose one honestly labelled path
      -> preserved Circle App Kit swap estimate (server-only key; execution binding incomplete)
      OR
      -> EOA ERC-20 USDC transfer (live RPC evidence; exact calldata binding)
   -> normalized EvidenceItem + provenance/freshness/digests
-  -> versioned ExecutionIntent + expectedEffects
-  -> deterministic versioned policy evaluation
-  -> partner-authenticated HumanAuthorization bound to preflightHash
-  -> separate owner wallet signature
-  -> transaction observation + actualEffects
-  -> reconciliationStatus + receiptHash
+  -> unsigned preflight material + deterministic policy preview
+  -> STOP: no partner authorization, execution record, reconciliation or receipt mutation
 ```
 
 The independent B2B contract is available separately:
@@ -31,9 +29,15 @@ The independent B2B contract is available separately:
 ```text
 Partner server
   -> tenant-scoped Bearer key
-  -> /v1 Intent / Preflight / Authorization / Execution / Receipt
+  -> /v1 Intent / Preflight / Authorization
+  -> separate owner wallet signature and partner-controlled broadcast
+  -> /v1 Execution / Receipt
   -> private headless TypeScript integration client
 ```
+
+The historical Gate B browser flow predates this anonymous boundary and is evidence for that exact
+recorded transfer only. It is not a reusable anonymous mutation path and does not authorize the demo
+cookie to stand in for partner authentication or wallet ownership.
 
 ## Trust boundaries
 
@@ -42,6 +46,7 @@ Partner server
 3. **Decision boundary.** The policy engine is deterministic. An LLM does not return a structured policy outcome or authorize execution.
 4. **Evidence boundary.** Missing, stale, conflicting, unavailable, unsupported, and fallback evidence remain explicit. A timeout or unsupported coverage cannot produce `ALLOWED_BY_POLICY`; provider errors are never converted to zero.
 5. **Execution boundary.** The current App Kit estimate does not expose final target/calldata. The prototype labels its binding `APP_KIT_REQUEST_NOT_CALLDATA` and disables swap execution until an exact external-signing payload can be verified. The EOA transfer path binds the ERC-20 contract target, transfer calldata, native value, amount, recipient, chain, and expiry.
+   Confirmed reconciliation also carries the transaction/block observation time. It must fall exactly within the authorization window and cannot be in the future; there is no retroactive clock-skew allowance, so an older matching transfer cannot be attached to a new decision record.
 6. **Persistence boundary.** The lifecycle lives behind an asynchronous store port (`lib/guard/store.ts`) with three adapters, and the adapter — never a constant — decides what the API is allowed to claim:
 
    | Adapter | `RYNTRA_GUARD_STORE` | Durability | Reported limitation |
@@ -72,12 +77,15 @@ Partner server
 
 ## Independent status axes
 
-`evidenceStatus`, `policyDecision`, authorization status, and `executionStatus` are separate. Evidence completeness is not a market claim. `ALLOWED_BY_POLICY` does not mean human-approved; human authorization does not mean wallet-signed; `SUBMITTED` does not mean confirmed; an RPC timeout after broadcast becomes `RECONCILIATION_REQUIRED`, not automatic failure.
+`evidenceStatus`, `policyDecision`, `authorizationStatus`, `executionStatus`, and `reconciliationStatus` are separate and serialized. Evidence completeness is not a market claim. `ALLOWED_BY_POLICY` does not mean human-approved; human authorization does not mean wallet-signed; `SUBMITTED` does not mean confirmed; `CONFIRMED` does not mean reconciled; an RPC timeout after broadcast becomes `RECONCILIATION_REQUIRED`, not automatic failure.
 
 ## Arc USDC interface normalization
 
 - Arc native USDC: 18 decimals; used for native balance and gas accounting.
 - Arc Testnet ERC-20 USDC: 6 decimals; used by the transfer calldata and ERC-20 balance.
+- Both views represent one underlying USDC balance. Preflight normalizes the transfer amount to
+  18-decimal units and requires that single balance to cover `transfer amount + estimated gas`;
+  passing two independent balance comparisons is insufficient.
 - Conversion uses decimal strings and `BigInt`; excess precision and scientific notation are rejected rather than rounded.
 
 ## Production hardening path

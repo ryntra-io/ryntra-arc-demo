@@ -28,6 +28,22 @@ jobs:
           node-version: 22
           cache: npm
 
+      # The npm version is part of the build. The lock file is
+      # resolver-specific — npm 10.9.8 and npm 11 compute different trees for
+      # one optional peer — so the pinned resolver is installed and asserted
+      # before the lock is used. Without this, the runner's default npm can
+      # reject a perfectly good lock.
+      - name: Pin and verify npm
+        run: |
+          PINNED=$(node -p "require('./package.json').packageManager.split('@')[1]")
+          npm install -g "npm@$PINNED"
+          ACTUAL=$(npm --version)
+          if [ "$ACTUAL" != "$PINNED" ]; then
+            echo "::error::npm $ACTUAL is active but package.json pins $PINNED."
+            exit 1
+          fi
+          echo "npm $ACTUAL active."
+
       # `npm ci` rather than `npm install`, so the lockfile is what is tested.
       - run: npm ci
 
@@ -37,9 +53,10 @@ jobs:
       - name: Lint
         run: npm run lint
 
-      # 73 tests. Four Postgres tests skip without DATABASE_URL and are meant
-      # to — they exercise the multi-writer adapter against a live database,
-      # and a faked pass there would be worse than a visible skip.
+      # Postgres tests skip without DATABASE_URL and are meant to — they
+      # exercise the multi-writer adapter against a live database, and a faked
+      # pass there would be worse than a visible skip. The total is deliberately
+      # not written here: a hard-coded count goes stale on the first added test.
       - name: Test
         run: npm test
 

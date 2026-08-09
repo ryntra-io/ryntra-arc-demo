@@ -100,7 +100,7 @@ export function lifecycleStates(input: LifecycleInput): Record<LifecycleStage, S
     BROADCAST: signed ? "DONE" : "PENDING",
     ARC_CONFIRMATION: input.confirmed ? "DONE" : signed ? "ACTIVE" : "PENDING",
     /* RECONCILIATION_REQUIRED is its own outcome — not a failure and not a
-       success. A real transaction exists and nobody has read what it did. It
+       success. A real transaction exists and its result has not been read. It
        is the one state an operator must not walk away from, so it cannot
        render as quiet progress. */
     RECONCILIATION:

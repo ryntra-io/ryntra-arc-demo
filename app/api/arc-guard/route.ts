@@ -17,6 +17,7 @@ import {
 } from "../../../lib/guard/arc-demo.ts";
 import { ARC_NETWORK, ARC_TESTNET, ARC_USDC_INTERFACES } from "../../../lib/guard/arc-app-kit.ts";
 import { ARC_NETWORKS, hexChainIdFor, publishedRpcEndpoints } from "../../../lib/guard/networks.ts";
+import { getArcVerificationStatus } from "../../../lib/guard/arc-verification.ts";
 import { RECORDED_RUN } from "../../arc/arc-project.ts";
 import {
   ARC_USDC_TRANSFER_POLICY,
@@ -30,7 +31,6 @@ import { getGuardRuntime } from "../../../lib/guard/runtime.ts";
 import { guardStoreLimitations } from "../../../lib/guard/store.ts";
 import { buildExecutionFingerprint, hashCanonical } from "../../../lib/guard/service.ts";
 import {
-  clientIp,
   privateNoStoreHeaders,
   rateLimitHeaders,
 } from "../../../lib/http-control.ts";
@@ -41,13 +41,14 @@ export const dynamic = "force-dynamic";
 const SESSION_COOKIE = "ryntra_arc_demo_session";
 const SESSION = /^demo_[0-9a-f]{32}$/;
 const IDEMPOTENCY = /^[A-Za-z0-9._:-]{8,256}$/;
+const FINANCIAL_DECIMAL = /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
 
 const EstimateActionSchema = z
   .object({
     action: z.literal("ESTIMATE_AND_PREFLIGHT"),
     walletAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
-    amountIn: z.string(),
-    slippageBps: z.number().int(),
+    amountIn: z.string().min(1).max(128).regex(FINANCIAL_DECIMAL),
+    slippageBps: z.number().int().min(0).max(100),
     idempotencyKey: z.string().regex(IDEMPOTENCY),
   })
   .strict();
@@ -67,7 +68,7 @@ const PrepareTransferActionSchema = z
     action: z.literal("PREPARE_TRANSFER"),
     walletAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
     recipientAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
-    amount: z.string(),
+    amount: z.string().min(1).max(128).regex(FINANCIAL_DECIMAL),
     idempotencyKey: z.string().regex(IDEMPOTENCY),
   })
   .strict();
@@ -98,6 +99,12 @@ const DemoActionSchema = z.discriminatedUnion("action", [
   AuthorizeActionSchema,
   RecordExecutionActionSchema,
   ReconcileTransferActionSchema,
+]);
+
+const ANONYMOUS_MONEY_ACTIONS = new Set([
+  "AUTHORIZE",
+  "RECORD_EXECUTION",
+  "RECONCILE_TRANSFER",
 ]);
 
 function sessionFromRequest(request: Request) {
@@ -182,6 +189,7 @@ function validationError() {
 }
 
 export async function GET(request: Request) {
+  const arcStatus = getArcVerificationStatus();
   const correlationId = correlationIdFromHeader(
     request.headers.get("x-correlation-id"),
     () => `corr_${randomUUID().replaceAll("-", "")}`,
@@ -238,11 +246,13 @@ export async function GET(request: Request) {
            `false` with a `null` hash for a day after Gate B passed, because a
            literal cannot notice that the world changed. Capability status is
            evidence, so it is read from the evidence. */
-        liveExecutionVerified: RECORDED_RUN.transactionHash !== null,
-        verifiedOperation: RECORDED_RUN.transactionHash ? "EOA_USDC_ERC20_TREASURY_TRANSFER" : null,
+        capabilityStatus: arcStatus.label,
+        liveExecutionVerified: arcStatus.isCurrent,
+        verifiedOperation: arcStatus.isCurrent ? "EOA_USDC_ERC20_TREASURY_TRANSFER" : null,
+        recordedOperation: "EOA_USDC_ERC20_TREASURY_TRANSFER",
         transactionHash: RECORDED_RUN.transactionHash,
         explorerUrl: RECORDED_RUN.explorerUrl,
-        authorizationMethod: "PARTNER_AUTHENTICATED",
+        authorizationMethod: "PARTNER_AUTHENTICATED_ON_AUTHENTICATED_V1_ONLY",
         executionBinding: "APP_KIT_REQUEST_NOT_CALLDATA",
         fallbackExecutionBinding: "EXACT_EVM_TARGET_CALLDATA_VALUE",
         nativeUsdcDecimals: ARC_USDC_INTERFACES.NATIVE.decimals,
@@ -258,7 +268,8 @@ export async function GET(request: Request) {
           "HACKATHON_PROTOTYPE",
           "NOT_AUDITED",
           "NOT_FINANCIAL_ADVICE",
-          ...(RECORDED_RUN.transactionHash ? [] : ["LIVE_EXECUTION_NOT_VERIFIED"]),
+          "ANONYMOUS_DEMO_CANNOT_AUTHORIZE_OR_RECORD_EXECUTION",
+          ...(arcStatus.isCurrent ? [] : ["RECORDED_RUN_REQUIRES_REVERIFICATION"]),
           "SWAP_NOT_VERIFIED",
           ...guardStoreLimitations(getGuardRuntime().store),
         ],
@@ -277,7 +288,7 @@ export async function POST(request: Request) {
   let rate: ReturnType<ReturnType<typeof getGuardRuntime>["limiter"]["consume"]> | undefined;
   try {
     const runtimeState = getGuardRuntime();
-    rate = runtimeState.limiter.consume(`arc-demo:${tenantId}:${clientIp(request.headers)}`);
+    rate = runtimeState.limiter.consume("arc-demo:anonymous");
     if (!rate.allowed) {
       throw new GuardApiError("RATE_LIMITED", "Arc demo rate limit reached.", {
         retryable: true,
@@ -296,6 +307,17 @@ export async function POST(request: Request) {
     }
     const parsed = DemoActionSchema.safeParse(await readBoundedGuardJson(request));
     if (!parsed.success) throw validationError();
+
+    if (ANONYMOUS_MONEY_ACTIONS.has(parsed.data.action)) {
+      throw new GuardApiError(
+        "CAPABILITY_UNAVAILABLE",
+        "The anonymous Arc demo cannot authorize, record execution, or reconcile a transaction.",
+        {
+          retryable: false,
+          requiredAction: "USE_AUTHENTICATED_PARTNER_API",
+        },
+      );
+    }
 
     if (parsed.data.action === "ESTIMATE_AND_PREFLIGHT") {
       const requestInput = {
@@ -445,8 +467,10 @@ export async function POST(request: Request) {
             evaluation: publicObject(evaluation),
             fingerprint,
             transaction: prepared.transaction,
-            executionAvailable: Boolean(authorizable && fingerprint),
-            executionBlocker: authorizable ? null : "TRANSFER_PREFLIGHT_NOT_AUTHORIZABLE",
+            executionAvailable: false,
+            executionBlocker: authorizable
+              ? "ANONYMOUS_DEMO_AUTHORIZATION_UNAVAILABLE"
+              : "TRANSFER_PREFLIGHT_NOT_AUTHORIZABLE",
             memoSupported: false,
           },
         },
@@ -543,6 +567,7 @@ export async function POST(request: Request) {
               provider: "Arc Testnet JSON-RPC",
               sourceRef: `${ARC_TESTNET.chainRef}:tx:${parsed.data.transactionHash.toLowerCase()}`,
               verificationStatus: "ONCHAIN_VERIFIED" as const,
+              observedAt: observed.observedAt,
               responseDigest: hashCanonical(observed),
             },
           }

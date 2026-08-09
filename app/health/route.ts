@@ -1,5 +1,6 @@
 import { publicGuardResponse } from "../../lib/guard/route.ts";
 import { getGuardRuntime } from "../../lib/guard/runtime.ts";
+import { getArcVerificationStatus } from "../../lib/guard/arc-verification.ts";
 import { RECORDED_RUN } from "../arc/arc-project.ts";
 
 export const runtime = "nodejs";
@@ -10,6 +11,7 @@ export async function GET(request: Request) {
      from a constant. A reviewer opening /health must be able to tell whether the
      lifecycle they are about to exercise survives the next request. */
   const guard = getGuardRuntime();
+  const arcStatus = getArcVerificationStatus();
   return publicGuardResponse(request, {
     ok: true,
     service: "ryntra-guard",
@@ -22,10 +24,12 @@ export async function GET(request: Request) {
        a day after Gate B passed — the third literal in this codebase to outlive
        the fact it described. A health endpoint that reports a stale capability
        is worse than one that reports none. */
-    liveArcExecution: RECORDED_RUN.transactionHash ? "TESTNET_VERIFIED" : "NOT_VERIFIED",
-    verifiedOperation: RECORDED_RUN.transactionHash
+    liveArcExecution: arcStatus.state,
+    verifiedOperation: arcStatus.isCurrent
       ? "EOA_USDC_ERC20_TREASURY_TRANSFER"
       : null,
+    recordedOperation: "EOA_USDC_ERC20_TREASURY_TRANSFER",
+    recordedAt: RECORDED_RUN.blockTimestamp,
     /* Whatever the transfer proved, the swap is not covered by it. */
     swapExecution: "NOT_VERIFIED",
   });

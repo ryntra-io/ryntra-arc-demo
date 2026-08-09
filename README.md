@@ -8,6 +8,9 @@
 > One real owner-authorized operation completed the full lifecycle on Arc Public Testnet. That
 > qualifier travels with the label everywhere in this repository, because it is the only operation
 > the claim covers.
+>
+> Source: public-safe extraction of the reviewed private candidate `00807b2` (2026-08-09), the
+> same candidate the deployed demo serves.
 
 `INDEPENDENT PROJECT` · `TESTNET ONLY` · `NOT AUDITED` · `NOT FINANCIAL ADVICE`
 
@@ -17,7 +20,7 @@
 
 A decision taken before signing does not prove what settled. Evidence can be stale, partial,
 unavailable or in conflict at the moment it matters, and the effects a user authorized can differ
-from the effects that landed on chain — and the comparison is often nobody's job.
+from the effects that landed on chain — and the comparison often has no owner.
 
 Ryntra Guard checks a supported programmable-money intent against available evidence and a declared
 policy **before** wallet authorization, tracks its Arc Testnet settlement, compares expected and

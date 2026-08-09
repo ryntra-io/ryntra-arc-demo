@@ -280,6 +280,11 @@ export function normalizeArcSwapEstimate({
   }
   const feeAmount =
     missingEvidence.length === 0 ? addDecimals((fees ?? []).map((fee) => fee.amount as string)) : null;
+  const feeTokens = [...new Set((fees ?? []).map((fee) => fee.token))];
+  const feeAssetRef =
+    fees && feeTokens.length <= 1
+      ? assetRef(feeTokens[0] ?? request.tokenIn)
+      : null;
   const totalDebit = feeAmount === null ? null : addDecimals([request.amountIn, feeAmount]);
   const requestHash = hashCanonical(request);
   const responseHash = hashCanonical(estimate);
@@ -325,14 +330,18 @@ export function normalizeArcSwapEstimate({
     facts: {
       quoteRef,
       providerRef: "circle-app-kit",
+      venueRef: "circle-app-kit",
       routeRef: "circle-app-kit:swap:Arc_Testnet",
       underlyingRouteDisclosure: "UNAVAILABLE_FROM_APP_KIT_ESTIMATE",
       sellAssetRef: assetRef(request.tokenIn),
       buyAssetRef: assetRef(request.tokenOut),
       amountIn: request.amountIn,
+      recipientAddress: request.recipientAddress.toLowerCase(),
+      leverage: null,
       expectedAmountOut: estimate.estimatedOutput.amount,
       minimumAmountOut: estimate.stopLimit.amount,
       feeAmount,
+      feeAssetRef,
       feeBreakdown: structuredClone(fees ?? []),
       totalDebit,
       slippageBps: String(request.slippageBps),

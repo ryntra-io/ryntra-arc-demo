@@ -31,8 +31,10 @@ export async function POST(
                   provider: "Partner application",
                   sourceRef: `partner-api:${body.transactionHash.toLowerCase()}`,
                   verificationStatus: "PROVIDER_REPORTED",
+                  observedAt: body.observedAt!,
                   responseDigest: hashCanonical({
                     transactionHash: body.transactionHash.toLowerCase(),
+                    observedAt: body.observedAt,
                     actualOutcome: body.actualOutcome,
                   }),
                 }

@@ -2,6 +2,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import ts from "typescript";
 
 async function loadSdk() {
   try {
@@ -51,6 +54,7 @@ test("the SDK exposes the exact intent lifecycle endpoints", async () => {
     });
   };
   const client = new RyntraGuardClient({ baseUrl: "https://guard.example", apiKey: "key", fetch });
+  await client.intents.list({ limit: 25 });
   await client.intents.get("int_001");
   await client.preflight("int_001", { evidence: [] }, { idempotencyKey: "idem-preflight-001" });
   await client.evaluations.get("eval_001");
@@ -62,17 +66,122 @@ test("the SDK exposes the exact intent lifecycle endpoints", async () => {
     { intentId: "int_001", authorizationId: "auth_001", fingerprint: {}, transactionHash: `0x${"ab".repeat(32)}` },
     { idempotencyKey: "idem-execute-001" },
   );
+  await client.executions.reconcile(
+    {
+      intentId: "int_001",
+      transactionHash: `0x${"ab".repeat(32)}`,
+      observedState: "CONFIRMED",
+      observedAt: "2026-08-08T12:00:00.000Z",
+      actualOutcome: {
+        amountIn: "10.00",
+        amountOut: "9.95",
+        feeAmount: "0.02",
+        explorerUrl: `https://testnet.arcscan.app/tx/0x${"ab".repeat(32)}`,
+      },
+    },
+    { idempotencyKey: "idem-reconcile-001" },
+  );
   await client.status.getByIntent("int_001");
   await client.receipts.getByIntent("int_001");
   assert.deepEqual(calls.map((call) => new URL(call.url).pathname), [
+    "/v1/intents",
     "/v1/intents/int_001",
     "/v1/intents/int_001/preflight",
     "/v1/evaluations/eval_001",
     "/v1/intents/int_001/authorize",
     "/v1/intents/int_001/executions",
+    "/v1/intents/int_001/executions",
     "/v1/intents/int_001/status",
     "/v1/intents/int_001/receipt",
   ]);
+  assert.equal(new URL(calls[0].url).searchParams.get("limit"), "25");
+  assert.equal(
+    JSON.parse(calls[6].init.body).observedAt,
+    "2026-08-08T12:00:00.000Z",
+  );
+});
+
+test("the SDK reconcile input is a generated-client-safe conditional union", () => {
+  const fixturePath = fileURLToPath(new URL("./reconcile-contract.fixture.ts", import.meta.url));
+  const fixtureSource = `
+    import { RyntraGuardClient } from "./index.ts";
+    declare const client: RyntraGuardClient;
+    declare const options: { idempotencyKey: string };
+    const transactionHash = "0x${"ab".repeat(32)}";
+    const actualOutcome = {
+      amountIn: "10.00",
+      amountOut: "9.95",
+      feeAmount: "0.02",
+      explorerUrl: "https://testnet.arcscan.app/tx/0x${"ab".repeat(32)}",
+    };
+
+    client.executions.reconcile({
+      intentId: "int_001",
+      transactionHash,
+      observedState: "CONFIRMED",
+      observedAt: "2026-08-08T12:00:00.000Z",
+      actualOutcome,
+    }, options);
+    client.executions.reconcile({
+      intentId: "int_001",
+      transactionHash,
+      observedState: "RPC_UNCERTAIN_AFTER_BROADCAST",
+    }, options);
+    client.executions.reconcile({
+      intentId: "int_001",
+      transactionHash,
+      observedState: "RPC_UNCERTAIN_AFTER_BROADCAST",
+      observedAt: "2026-08-08T12:00:00.000Z",
+      actualOutcome,
+    }, options);
+    // @ts-expect-error CONFIRMED requires observedAt and actualOutcome.
+    client.executions.reconcile({
+      intentId: "int_001",
+      transactionHash,
+      observedState: "CONFIRMED",
+    }, options);
+  `;
+  const compilerOptions = {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    allowImportingTsExtensions: true,
+    strict: true,
+    noEmit: true,
+    skipLibCheck: true,
+  };
+  const host = ts.createCompilerHost(compilerOptions);
+  const normalizedFixturePath = path.normalize(fixturePath);
+  const originalFileExists = host.fileExists.bind(host);
+  const originalReadFile = host.readFile.bind(host);
+  const originalGetSourceFile = host.getSourceFile.bind(host);
+  host.fileExists = (fileName) =>
+    path.normalize(fileName) === normalizedFixturePath || originalFileExists(fileName);
+  host.readFile = (fileName) =>
+    path.normalize(fileName) === normalizedFixturePath ? fixtureSource : originalReadFile(fileName);
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
+    path.normalize(fileName) === normalizedFixturePath
+      ? ts.createSourceFile(fileName, fixtureSource, languageVersion, true)
+      : originalGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
+  const program = ts.createProgram([fixturePath], compilerOptions, host);
+  const diagnostics = ts.getPreEmitDiagnostics(program);
+  assert.deepEqual(
+    diagnostics.map((diagnostic) => ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n")),
+    [],
+  );
+});
+
+test("the SDK rejects unsupported list limits and authorization methods", async () => {
+  const { RyntraGuardClient } = await loadSdk();
+  const client = new RyntraGuardClient({
+    baseUrl: "https://guard.example",
+    fetch: async () => new Response(JSON.stringify({ data: {} })),
+  });
+  assert.throws(() => client.intents.list({ limit: 0 }), /integer from 1 to 200/);
+  const source = await readFile(new URL("./index.ts", import.meta.url), "utf8");
+  const authorizeInput = source.slice(source.indexOf("readonly authorize"), source.indexOf("readonly executions"));
+  assert.doesNotMatch(authorizeInput, /EIP712/);
+  assert.match(authorizeInput, /method: "PARTNER_AUTHENTICATED"/);
 });
 
 test("structured API failures become typed SDK errors with correlation and remediation", async () => {
