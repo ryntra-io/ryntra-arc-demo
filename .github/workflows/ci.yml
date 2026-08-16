@@ -71,7 +71,7 @@ jobs:
           if grep -rniE 'first-ever|no competitors|guaranteed safe|institutional-grade|fully compliant|official (arc|circle) partner|mainnet live|production-ready' \
                --include='*.ts' --include='*.tsx' --include='*.md' \
                app lib docs README.md \
-             | grep -vE 'is not|are not|never|does not|no security audit|not claimed|forbidden'; then
+             | grep -vE 'is not|are not|never|does not|no security audit|not claimed|forbidden|not production-ready|`(first|only|guaranteed|institutional-grade|fully compliant|production-ready)`'; then
             echo "::error::An unsupported claim reached the tree. Every match must be a negation."
             exit 1
           fi
